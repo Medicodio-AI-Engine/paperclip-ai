@@ -1,0 +1,35 @@
+name: Sync upstream master
+
+# Brings commits from the official upstream repo into THIS fork's master, every 2 days.
+# Lives in the fork at: .github/workflows/sync-upstream.yml
+# Uses merge (not force) so this workflow file is preserved while upstream commits flow in.
+
+on:
+  schedule:
+    - cron: '0 3 */2 * *'      # every 2 days at 03:00 UTC (~08:30 IST). GitHub cron is UTC.
+  workflow_dispatch: {}         # adds a manual "Run workflow" button too
+
+permissions:
+  contents: write               # allow pushing to the fork's master
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream into fork master
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/paperclipai/paperclip.git
+          git fetch upstream master
+          git checkout master
+          # merge upstream changes; keeps our workflow file. --no-edit = no editor prompt.
+          git merge --no-edit upstream/master
+          git push origin master
