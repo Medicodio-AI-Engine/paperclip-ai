@@ -1,18 +1,14 @@
 name: Sync upstream master
 
-# Pulls commits from the official upstream repo into THIS fork's master, every 3 days.
-# Lives in the fork at: .github/workflows/sync-upstream.yml
-#
-# Uses GitHub's NATIVE fork-sync ("merge-upstream" API).
-# IMPORTANT: must authenticate with a PAT that has the `workflow` scope (secret SYNC_PAT).
-# The built-in GITHUB_TOKEN is FORBIDDEN from updating .github/workflows/* files (hard rule),
-# and upstream changes those files — so GITHUB_TOKEN fails with 422. A PAT with `workflow`
-# scope is the documented fix.
+# Every 3 days: pull upstream commits into this fork (native merge-upstream API),
+# and if anything actually merged, poke Jenkins to start the deploy pipeline.
+# merge-upstream needs a PAT with `workflow` scope (secret SYNC_PAT) because the
+# built-in GITHUB_TOKEN is forbidden from updating .github/workflows/* files.
 
 on:
   schedule:
-    - cron: '0 3 */3 * *'      # every 3 days at 03:00 UTC (~08:30 IST). GitHub cron is UTC.
-  workflow_dispatch: {}         # manual "Run workflow" button
+    - cron: '0 3 */3 * *'      # every 3 days at 03:00 UTC (~08:30 IST)
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -21,14 +17,28 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync fork master from upstream (native merge-upstream)
+      - name: Sync fork master from upstream
+        id: sync
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}   # PAT with `workflow` scope (NOT the default GITHUB_TOKEN)
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}   # PAT with `workflow` scope
         run: |
           set -e
-          echo "Syncing ${{ github.repository }}:master from upstream..."
-          gh api --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${{ github.repository }}/merge-upstream" \
-            -f branch=master
-          echo "Sync done."
+          RESP=$(gh api --method POST -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/merge-upstream" -f branch=master)
+          echo "$RESP"
+          MT=$(echo "$RESP" | jq -r '.merge_type // "none"')
+          echo "merge_type=$MT" >> "$GITHUB_OUTPUT"
+          echo "merge_type = $MT"
+
+      - name: Trigger Jenkins deploy (only when sync succeeded AND new commits merged)
+        if: ${{ success() && steps.sync.outputs.merge_type != 'none' }}
+        env:
+          JENKINS_TOKEN:       ${{ secrets.JENKINS_TOKEN }}        # Jenkins user API token (user: dev-team)
+          JENKINS_BUILD_TOKEN: ${{ secrets.JENKINS_BUILD_TOKEN }}  # the "Trigger builds remotely" token
+        run: |
+          set -e
+          echo "New commits merged -> triggering Jenkins deploy..."
+          curl -fsS -X POST \
+            "https://ci.medicodio.com/job/Paperclip%20Deploy/build?token=${JENKINS_BUILD_TOKEN}" \
+            --user "dev-team:${JENKINS_TOKEN}"
+          echo "Jenkins deploy triggered."
