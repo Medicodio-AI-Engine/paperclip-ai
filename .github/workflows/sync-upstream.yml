@@ -3,9 +3,11 @@ name: Sync upstream master
 # Pulls commits from the official upstream repo into THIS fork's master, every 3 days.
 # Lives in the fork at: .github/workflows/sync-upstream.yml
 #
-# Uses GitHub's NATIVE fork-sync ("merge-upstream" API) — the same thing the green
-# "Sync fork → Update branch" button does. Runs server-side, so it's allowed to update
-# .github/workflows/* files (a raw git push with GITHUB_TOKEN is NOT). No PAT needed.
+# Uses GitHub's NATIVE fork-sync ("merge-upstream" API).
+# IMPORTANT: must authenticate with a PAT that has the `workflow` scope (secret SYNC_PAT).
+# The built-in GITHUB_TOKEN is FORBIDDEN from updating .github/workflows/* files (hard rule),
+# and upstream changes those files — so GITHUB_TOKEN fails with 422. A PAT with `workflow`
+# scope is the documented fix.
 
 on:
   schedule:
@@ -21,7 +23,7 @@ jobs:
     steps:
       - name: Sync fork master from upstream (native merge-upstream)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}   # PAT with `workflow` scope (NOT the default GITHUB_TOKEN)
         run: |
           set -e
           echo "Syncing ${{ github.repository }}:master from upstream..."
