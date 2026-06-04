@@ -1,35 +1,32 @@
 name: Sync upstream master
 
-# Brings commits from the official upstream repo into THIS fork's master, every 2 days.
+# Pulls commits from the official upstream repo into THIS fork's master, every 3 days.
 # Lives in the fork at: .github/workflows/sync-upstream.yml
-# Uses merge (not force) so this workflow file is preserved while upstream commits flow in.
+#
+# Uses GitHub's NATIVE fork-sync ("merge-upstream" API) — the same thing the green
+# "Sync fork → Update branch" button does. Runs server-side, so it's allowed to update
+# .github/workflows/* files (a raw git push with GITHUB_TOKEN is NOT). No PAT needed.
 
 on:
   schedule:
-    - cron: '0 3 */3 * *'      # every 2 days at 03:00 UTC (~08:30 IST). GitHub cron is UTC.
-  workflow_dispatch: {}         # adds a manual "Run workflow" button too
+    - cron: '0 3 */3 * *'      # every 3 days at 03:00 UTC (~08:30 IST). GitHub cron is UTC.
+  workflow_dispatch: {}         # manual "Run workflow" button
 
 permissions:
-  contents: write               # allow pushing to the fork's master
+  contents: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork (full history)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Merge upstream into fork master
+      - name: Sync fork master from upstream (native merge-upstream)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/paperclipai/paperclip.git
-          git fetch upstream master
-          git checkout master
-          # merge upstream changes; keeps our workflow file. --no-edit = no editor prompt.
-          git merge --no-edit upstream/master
-          git push origin master
+          echo "Syncing ${{ github.repository }}:master from upstream..."
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/merge-upstream" \
+            -f branch=master
+          echo "Sync done."
