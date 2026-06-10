@@ -128,7 +128,8 @@ export function InstanceExperimentalSettings() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: "Instance Settings" },
+      { label: "Settings", href: "/company/settings" },
+      { label: "Instance settings", href: "/company/settings/instance/general" },
       { label: "Experimental" },
     ]);
   }, [setBreadcrumbs]);
@@ -209,6 +210,8 @@ export function InstanceExperimentalSettings() {
     experimentalQuery.data?.enableStreamlinedLeftNavigation === true;
   const enableIssuePlanDecompositions =
     experimentalQuery.data?.enableIssuePlanDecompositions === true;
+  const enableExperimentalFileViewer =
+    experimentalQuery.data?.enableExperimentalFileViewer === true;
   const enableCloudSync = experimentalQuery.data?.enableCloudSync === true;
   const autoRestartDevServerWhenIdle = experimentalQuery.data?.autoRestartDevServerWhenIdle === true;
   const enableIssueGraphLivenessAutoRecovery =
@@ -281,6 +284,27 @@ export function InstanceExperimentalSettings() {
             onCheckedChange={() => toggleMutation.mutate({ enableEnvironments: !enableEnvironments })}
             disabled={toggleMutation.isPending}
             aria-label="Toggle environments experimental setting"
+          />
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-border bg-card p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1.5">
+            <h2 className="text-sm font-semibold">Experimental File Viewer</h2>
+            <p className="max-w-2xl text-sm text-muted-foreground">
+              Show task detail controls for browsing and previewing workspace files relative to a task.
+            </p>
+          </div>
+          <ToggleSwitch
+            checked={enableExperimentalFileViewer}
+            onCheckedChange={() =>
+              toggleMutation.mutate({
+                enableExperimentalFileViewer: !enableExperimentalFileViewer,
+              })
+            }
+            disabled={toggleMutation.isPending}
+            aria-label="Toggle experimental file viewer setting"
           />
         </div>
       </section>

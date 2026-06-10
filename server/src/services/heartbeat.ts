@@ -528,9 +528,8 @@ export function extractMentionedSkillIdsFromSources(
   for (const source of sources) {
     if (typeof source !== "string" || source.length === 0) continue;
     for (const skillId of extractSkillMentionIds(source)) {
-      if (isUuidLike(skillId)) {
-        mentionedIds.add(skillId);
-      }
+      if (!isUuidLike(skillId)) continue;
+      mentionedIds.add(skillId);
     }
   }
   return [...mentionedIds];
@@ -1996,8 +1995,12 @@ function deriveTaskKey(
 
 /**
  * Extended task key derivation that falls back to a stable synthetic key
- * for timer/heartbeat wakes. This ensures timer wakes can resume their
- * previous session via `agentTaskSessions` instead of starting fresh.
+ * for timer/heartbeat wakes. The synthetic key keeps the
+ * `agentTaskSessions` row addressable across heartbeats so the row can be
+ * cleared and re-keyed deterministically; it does NOT mean the prior
+ * session is resumed. Since PF-4 (#4838), `heartbeat_timer` wakes always
+ * go through `shouldResetTaskSessionForWake` and start a fresh session —
+ * see `describeSessionResetReason` for the paired log message.
  *
  * The synthetic key is only used when:
  * - No explicit task/issue key exists in the context
@@ -2026,7 +2029,14 @@ export function shouldResetTaskSessionForWake(
     wakeReason === "issue_assigned" ||
     wakeReason === "execution_review_requested" ||
     wakeReason === "execution_approval_requested" ||
-    wakeReason === "execution_changes_requested"
+    wakeReason === "execution_changes_requested" ||
+    // PF-4: timer-driven wakes are exploratory ("any new work?"). They do not
+    // carry meaningful continuation state, so reusing the prior task session
+    // for repeated timer wakes accumulates low-value context and pushes the
+    // session toward the 64k compaction threshold (observed in CEO run
+    // 292a5fd1, where timer wakes repeatedly bloated a long-lived manager
+    // session). Reset on every timer wake so each interval starts fresh.
+    wakeReason === "heartbeat_timer"
   ) {
     return true;
   }
@@ -2091,7 +2101,7 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
   };
 }
 
-function describeSessionResetReason(
+export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
   if (contextSnapshot?.forceFreshSession === true) return "forceFreshSession was requested";
@@ -2101,7 +2111,24 @@ function describeSessionResetReason(
   if (wakeReason === "execution_review_requested") return "wake reason is execution_review_requested";
   if (wakeReason === "execution_approval_requested") return "wake reason is execution_approval_requested";
   if (wakeReason === "execution_changes_requested") return "wake reason is execution_changes_requested";
+  // PF-4: paired with shouldResetTaskSessionForWake — keep the reason wording
+  // explicit so run logs make session reuse/reset behavior legible.
+  if (wakeReason === "heartbeat_timer") return "wake reason is heartbeat_timer (timer-driven wake starts fresh)";
   return null;
+}
+
+export function shouldDeferFollowupWakeForSameIssue(input: {
+  activeRunStatus: string | null | undefined;
+  isSameExecutionAgent: boolean;
+  wakeCommentId: string | null | undefined;
+  forceFreshSession: boolean;
+}) {
+  // A comment follow-up or explicit fresh-session wake needs a new run boundary.
+  if (!input.isSameExecutionAgent) return false;
+  if (input.activeRunStatus !== "running") return false;
+  if (input.wakeCommentId) return true;
+  if (input.forceFreshSession) return true;
+  return false;
 }
 
 function shouldAutoCheckoutIssueForWake(input: {
@@ -2291,20 +2318,6 @@ function normalizeInteractionContinuationWakeContext(
   clearInteractionContinuationWakeContext(contextSnapshot);
 }
 
-function isAcceptedPlanContinuationWakeContext(
-  contextSnapshot: Record<string, unknown>,
-  issueWorkMode?: string | null,
-) {
-  return (
-    readNonEmptyString(contextSnapshot.workspaceRefreshReason) === "accepted_plan_confirmation" ||
-    (
-      issueWorkMode === "planning" &&
-      readNonEmptyString(contextSnapshot.interactionKind) === "request_confirmation" &&
-      readNonEmptyString(contextSnapshot.interactionStatus) === "accepted"
-    )
-  );
-}
-
 type AcceptedPlanWakeRoutingDecision = {
   otherActiveClaimIssueId: string;
   otherActiveClaimIdentifier: string | null;
@@ -2367,6 +2380,9 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
+    merged.forceFreshSession = true;
+  }
   const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
@@ -2411,7 +2427,7 @@ export async function buildPaperclipWakePayload(input: {
   exposeLowTrustRaw?: boolean;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
-  let commentIds = extractWakeCommentIds(input.contextSnapshot);
+  const commentIds = extractWakeCommentIds(input.contextSnapshot);
   const annotationCommentId = readNonEmptyString(input.contextSnapshot.annotationCommentId);
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
   const continuationSummary = input.continuationSummary ?? null;
@@ -2431,28 +2447,6 @@ export async function buildPaperclipWakePayload(input: {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
-  let acceptedPlanCommentWindowTruncated = false;
-  const acceptedPlanContinuationWake = isAcceptedPlanContinuationWakeContext(
-    input.contextSnapshot,
-    issueSummary?.workMode,
-  );
-  if (commentIds.length === 0 && acceptedPlanContinuationWake && issueSummary?.id) {
-    const recentPlanCommentRows = await input.db
-      .select({ id: issueComments.id })
-      .from(issueComments)
-      .where(and(
-        eq(issueComments.companyId, input.companyId),
-        eq(issueComments.issueId, issueSummary.id),
-        isNull(issueComments.deletedAt),
-      ))
-      .orderBy(desc(issueComments.createdAt))
-      .limit(MAX_INLINE_WAKE_COMMENTS + 1);
-    acceptedPlanCommentWindowTruncated = recentPlanCommentRows.length > MAX_INLINE_WAKE_COMMENTS;
-    commentIds = recentPlanCommentRows
-      .slice(0, MAX_INLINE_WAKE_COMMENTS)
-      .reverse()
-      .map((comment) => comment.id);
-  }
   if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
@@ -2487,7 +2481,7 @@ export async function buildPaperclipWakePayload(input: {
   const commentsById = new Map(commentRows.map((comment) => [comment.id, comment]));
   const comments: Array<Record<string, unknown>> = [];
   let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
-  let truncated = acceptedPlanCommentWindowTruncated;
+  let truncated = false;
   let missingCommentCount = 0;
   const safeContinuationSummary =
     continuationSummary && !input.exposeLowTrustRaw
@@ -2625,9 +2619,6 @@ export async function buildPaperclipWakePayload(input: {
       : null,
     interactionKind: readNonEmptyString(input.contextSnapshot.interactionKind),
     interactionStatus: readNonEmptyString(input.contextSnapshot.interactionStatus),
-    commentContextSource: acceptedPlanContinuationWake && commentIds.length > 0
-      ? "accepted_plan_confirmation"
-      : null,
     checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
     dependencyBlockedInteraction: input.contextSnapshot.dependencyBlockedInteraction === true,
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
@@ -2702,11 +2693,6 @@ export function buildPaperclipTaskMarkdown(input: {
     kind?: string | null;
     status?: string | null;
   } | null;
-  acceptedPlanComments?: Array<{
-    id?: string | null;
-    authorType?: string | null;
-    body?: string | null;
-  }> | null;
   acceptedPlanContinuation?: boolean;
 }) {
   const quoteTaskScalar = (value: string) => JSON.stringify(value);
@@ -2766,28 +2752,6 @@ export function buildPaperclipTaskMarkdown(input: {
   }
   if (wakeComment?.body.trim()) {
     lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
-  }
-  if (acceptedPlanContinuation) {
-    const acceptedPlanComments = (input.acceptedPlanComments ?? [])
-      .map((comment) => ({
-        ...comment,
-        body: comment.body?.trim() ?? "",
-      }))
-      .filter((comment) => comment.body.length > 0)
-      .slice(0, MAX_INLINE_WAKE_COMMENTS);
-    if (acceptedPlanComments.length > 0) {
-      lines.push("", "Comments included with the confirmed plan:");
-      for (const [index, comment] of acceptedPlanComments.entries()) {
-        const authorType = comment.authorType?.trim();
-        const commentId = comment.id?.trim();
-        const labelParts = [
-          `Comment ${index + 1}`,
-          ...(authorType ? [authorType] : []),
-          ...(commentId ? [commentId] : []),
-        ];
-        lines.push("", `${labelParts.join(" - ")}:`, fenceTaskText(comment.body));
-      }
-    }
   }
   lines.push("", "Use this task context as the current assignment.");
   return lines.join("\n");
@@ -7815,7 +7779,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           companyId: agent.companyId,
           agentId: agent.id,
           issueId,
-          acceptedPlanContinuationWake: isAcceptedPlanContinuationWakeContext(context, issueContext.workMode),
+          acceptedPlanContinuationWake:
+            readNonEmptyString(context.workspaceRefreshReason) === "accepted_plan_confirmation"
+            || (
+              issueContext.workMode === "planning"
+              && readNonEmptyString(context.interactionKind) === "request_confirmation"
+              && readNonEmptyString(context.interactionStatus) === "accepted"
+            ),
           contextSnapshot: context,
         })
       : null;
@@ -7954,18 +7924,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
     }
-    const acceptedPlanWakeRouting = parseObject(context.acceptedPlanWakeRouting);
-    const acceptedPlanContinuationForTask =
-      isAcceptedPlanContinuationWakeContext(context, issueRef?.workMode) &&
-      Object.keys(acceptedPlanWakeRouting).length === 0;
-    const acceptedPlanCommentsForTask =
-      acceptedPlanContinuationForTask && Array.isArray(paperclipWakePayload?.comments)
-        ? paperclipWakePayload.comments.map((comment) => ({
-            id: readNonEmptyString(comment.id),
-            authorType: readNonEmptyString(comment.authorType),
-            body: readNonEmptyString(comment.body),
-          }))
-        : null;
     const taskMarkdown = buildPaperclipTaskMarkdown({
       issue: issueRef
         ? {
@@ -7981,8 +7939,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         kind: readNonEmptyString(context.interactionKind),
         status: readNonEmptyString(context.interactionStatus),
       },
-      acceptedPlanComments: acceptedPlanCommentsForTask,
-      acceptedPlanContinuation: acceptedPlanContinuationForTask,
+      acceptedPlanContinuation:
+        readNonEmptyString(context.workspaceRefreshReason) === "accepted_plan_confirmation"
+        && Object.keys(parseObject(context.acceptedPlanWakeRouting)).length === 0,
     });
     if (issueRef) {
       context.paperclipIssue = {
@@ -9296,11 +9255,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           await setRunStatus(runId, "failed", {
             error: message,
-            errorCode: "adapter_failed",
+            errorCode: "setup_failed",
             finishedAt: new Date(),
             ...(setupFailureAgent ? {
               resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
-                errorCode: "adapter_failed",
+                errorCode: "setup_failed",
                 errorMessage: message,
               }),
             } : {}),
@@ -10296,12 +10255,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             normalizeAgentNameKey(executionAgent?.name);
           const isSameExecutionAgent =
             Boolean(executionAgentNameKey) && executionAgentNameKey === agentNameKey;
+          const shouldDeferFollowupWake = shouldDeferFollowupWakeForSameIssue({
+            activeRunStatus: activeExecutionRun.status,
+            isSameExecutionAgent,
+            wakeCommentId,
+            forceFreshSession: enrichedContextSnapshot.forceFreshSession === true,
+          });
           const shouldQueueFollowupForRunningWake =
             shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId }) &&
             activeExecutionRun.status === "running" &&
             isSameExecutionAgent;
 
-          if (isSameExecutionAgent && !shouldQueueFollowupForRunningWake) {
+          if (isSameExecutionAgent && !shouldDeferFollowupWake && !shouldQueueFollowupForRunningWake) {
             const mergedContextSnapshot = mergeCoalescedContextSnapshot(
               activeExecutionRun.contextSnapshot,
               enrichedContextSnapshot,
@@ -10684,41 +10649,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return wakeupIds.length;
   }
 
-  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane") {
+  type CancelRunOptions = {
+    errorCode?: string;
+    resultJson?: Record<string, unknown>;
+    eventMessage?: string;
+    eventPayload?: Record<string, unknown>;
+  };
+
+  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
     const agent = await getAgent(run.agentId);
+    const errorCode = options.errorCode ?? "cancelled";
+    const resultJson = agent
+      ? {
+          ...mergeRunStopMetadataForAgent(agent, "cancelled", {
+            resultJson: parseObject(run.resultJson),
+            errorCode,
+            errorMessage: reason,
+          }),
+          ...(options.resultJson ?? {}),
+        }
+      : options.resultJson;
 
     const running = runningProcesses.get(run.id);
-    if (running) {
-      await terminateHeartbeatRunProcess({
-        pid: running.child.pid ?? run.processPid,
-        processGroupId: running.processGroupId ?? run.processGroupId,
-        graceMs: Math.max(1, running.graceSec) * 1000,
-      });
-    } else if (run.processPid || run.processGroupId) {
-      await terminateHeartbeatRunProcess({
-        pid: run.processPid,
-        processGroupId: run.processGroupId,
-      });
+    try {
+      if (running) {
+        await terminateHeartbeatRunProcess({
+          pid: running.child.pid ?? run.processPid,
+          processGroupId: running.processGroupId ?? run.processGroupId,
+          graceMs: Math.max(1, running.graceSec) * 1000,
+        });
+      } else if (run.processPid || run.processGroupId) {
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
+      }
+    } finally {
+      runningProcesses.delete(run.id);
     }
 
+    const finishedAt = new Date();
     const cancelled = await setRunStatus(run.id, "cancelled", {
-      finishedAt: new Date(),
+      finishedAt,
       error: reason,
-      errorCode: "cancelled",
-      ...(agent ? {
-        resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
-          resultJson: parseObject(run.resultJson),
-          errorCode: "cancelled",
-          errorMessage: reason,
-        }),
-      } : {}),
+      errorCode,
+      ...(resultJson ? { resultJson } : {}),
     });
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-      finishedAt: new Date(),
+      finishedAt,
       error: reason,
     });
 
@@ -10727,12 +10709,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "run cancelled",
+        message: options.eventMessage ?? "run cancelled",
+        ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
       await releaseIssueExecutionAndPromote(cancelled);
     }
 
-    runningProcesses.delete(run.id);
     await finalizeAgentStatus(run.agentId, "cancelled");
     await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
@@ -11172,7 +11154,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     },
 
-    cancelRun: (runId: string, reason?: string) => cancelRunInternal(runId, reason),
+    cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason),
 
