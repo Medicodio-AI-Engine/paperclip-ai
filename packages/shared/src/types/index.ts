@@ -19,13 +19,26 @@ export type {
   AttentionItem,
   AttentionItemDetail,
   AttentionItemDismissal,
+  AttentionFeedQuery,
   AttentionProjectRef,
+  AttentionQueueRef,
   AttentionSeverity,
+  AttentionSortMode,
   AttentionSourceKind,
   AttentionSubject,
   AttentionSubjectKind,
+  AttentionTriageAttribution,
   AttentionWorkspaceRef,
 } from "./attention.js";
+export { ATTENTION_SOURCE_KINDS } from "./attention.js";
+export type {
+  DecisionQueue,
+  DecisionQueueItem,
+  DecisionQueueSeedRule,
+  DecisionQueueSeedRuleSignal,
+  DecisionTriage,
+  DecisionTriageDecideBy,
+} from "./decision-queue.js";
 export type {
   DecisionTrainingExample,
   DecisionTrainingNotesHistoryEntry,
@@ -155,6 +168,9 @@ export type {
   CompanySkillImportRequest,
   CompanySkillImportResult,
   CompanySkillProjectScanRequest,
+  CompanySkillProjectBrowseRequest,
+  CompanySkillProjectBrowseEntry,
+  CompanySkillProjectBrowseResult,
   CompanySkillProjectScanCandidateStatus,
   CompanySkillProjectScanCandidate,
   CompanySkillProjectScanSkipped,
@@ -345,6 +361,7 @@ export type {
   WorkspaceRealizationTransport,
   ExecutionWorkspaceStrategyType,
   ExecutionWorkspaceMode,
+  SharedWorkspaceConcurrency,
   ExecutionWorkspaceProviderType,
   ExecutionWorkspaceStatus,
   ExecutionWorkspaceStrategy,
@@ -809,6 +826,8 @@ export type {
   DecisionChosenOptionCount,
   DecisionRuleKeyStats,
   DecisionStatsResponse,
+  AttentionArchiveManifestEntry,
+  AttentionArchiveTargetSnapshot,
 } from "./decision.js";
 export type {
   AccessUserProfile,
