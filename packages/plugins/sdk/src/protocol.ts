@@ -671,6 +671,20 @@ export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverB
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  /**
+   * Run this command outside the lease's persistent session.
+   *
+   * The host sets this flag on a command that runs before the run's agent work,
+   * for example the workspace provision command. A provider that opens a
+   * persistent session on the first command must NOT open the session for such a
+   * command; it runs the command one-shot and leaves the session closed. The
+   * session then opens on the first in-run command instead. A provider that does
+   * not use a persistent session ignores this flag.
+   *
+   * The default (absent or `false`) keeps the session path, so a normal in-run
+   * command opens and reuses the session as before.
+   */
+  bypassSession?: boolean;
 }
 
 export interface PluginEnvironmentExecuteResult {
@@ -1303,6 +1317,15 @@ export interface WorkerToHostMethods {
       attributes?: Record<string, string | number | boolean>;
       /** The optional span status. */
       status?: { code: number; message?: string };
+      /** The optional span start time as epoch milliseconds (`Date.now()`).
+       * The worker captures it when it opens the span. The host validates the
+       * pair and records the span with its true native width. An omitted value
+       * makes the host fall back to a synchronous open-and-end. */
+      startTimeMs?: number;
+      /** The optional span end time as epoch milliseconds (`Date.now()`). The
+       * worker captures it when it ends the span. The host uses it as the span
+       * end time when the pair passes the clock-safety check. */
+      endTimeMs?: number;
     },
     result: void,
   ];
