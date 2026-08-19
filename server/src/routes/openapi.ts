@@ -112,6 +112,7 @@ import {
   environmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageTemplateSchema,
   finishEnvironmentCustomImageSetupSessionSchema,
+  relinkEnvironmentCustomImageTemplateSchema,
   updateEnvironmentSchema,
   probeEnvironmentConfigSchema,
   startEnvironmentCustomImageSetupSessionSchema,
@@ -224,6 +225,13 @@ import {
   importMcpJsonSchema,
   toolPolicyTestRequestSchema,
   createToolMcpGatewaySchema,
+  startClaudeSetupTokenSessionRequestSchema,
+  submitBrowserCodeRequestSchema,
+  claudeSetupTokenSessionResponseSchema,
+  claudeSetupTokenSessionPromptSchema,
+  claudeSetupTokenSessionOwnerResponseSchema,
+  claudeSetupTokenCompletionResponseSchema,
+  claudeOAuthTokenStatusResponseSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -385,6 +393,10 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
     }
     const jsonSchema: JsonSchema = { type: "object", properties };
     if (required.length > 0) jsonSchema.required = required;
+    // A `.strict()` Zod object forbids an unknown key. Publish that constraint
+    // as `additionalProperties: false`, so a client, a gateway, or a handler
+    // that treats the contract as authoritative rejects an extra property too.
+    if (unwrapped._def.unknownKeys === "strict") jsonSchema.additionalProperties = false;
     return jsonSchema;
   }
 
@@ -622,6 +634,11 @@ const environmentCustomImageSetupSessionFinishResultSchema =
 const environmentCustomImageTemplateRollbackResultSchema = z.object({
   activeTemplate: environmentCustomImageTemplateSchema,
   supersededTemplate: environmentCustomImageTemplateSchema,
+}).strict();
+
+const environmentCustomImageTemplateRelinkResultSchema = z.object({
+  template: environmentCustomImageTemplateSchema,
+  classification: z.enum(["knob_only", "boot_source_drift", "unclassified"]),
 }).strict();
 
 const workTimelineQuerySchema = z.object({
@@ -1687,6 +1704,7 @@ registry.registerPath({
 
 const AgentSecretListResponseSchema = z.object({
   secrets: z.array(z.object({
+    secretRef: z.string().uuid(),
     key: z.string(),
     name: z.string(),
     description: z.string().nullable(),
@@ -1709,12 +1727,24 @@ const createAgentSecretProposalSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("binding"),
     secretId: z.string().uuid().optional(),
+    sourceConfigPath: z.string().min(1).optional(),
     secretProposalId: z.string().uuid().optional(),
     targetAgentId: z.string().uuid().optional(),
     configPath: z.string().min(1),
     justification: z.string().min(1),
   }),
-]);
+]).superRefine((value, ctx) => {
+  if (
+    value.kind === "binding"
+    && [value.secretId, value.sourceConfigPath, value.secretProposalId]
+      .filter((reference) => Boolean(reference)).length !== 1
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Provide exactly one of secretId, sourceConfigPath, or secretProposalId",
+    });
+  }
+});
 
 const approveSecretProposalSchema = z.object({
   cascade: z.boolean().optional(),
@@ -4498,18 +4528,44 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
-// Setup-token login session routes. The owner user starts one session, reads the
-// login prompt, submits the browser code, and receives the token. The prompt,
-// code, and token responses require a confidential transport; the guard returns
-// 403 when the transport is not confidential.
+// Company-and-environment Claude setup-token login session routes. The owner
+// user starts one session for one adapter in one environment. The scope carries
+// no agent id, so a hire flow with no agent still starts one session. The owner
+// reads the login prompt, submits the browser code from the browser, and reads
+// the completion claim. The prompt, code, and completion responses require a
+// confidential transport; the guard returns 403 when the transport is not
+// confidential. No response carries a token; the completion returns the
+// non-secret `storedSessionId` claim.
+//
+// The stored-token status read returns only the secret id and the latest version
+// of the owner value; it returns no token. The server derives the owner from the
+// authenticated actor. A missing or a foreign value returns the same fixed 404,
+// so the read discloses no existence distinction. The response is `no-store`.
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/claude-oauth-token-status",
+  tags: ["companies"],
+  summary: "Read the stored Claude OAuth token status for the authenticated owner",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: r.ok(claudeOAuthTokenStatusResponseSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
 registry.registerPath({
   method: "post",
-  path: "/api/agents/{id}/setup-token-login-sessions",
-  tags: ["agents"],
-  summary: "Start a setup-token login session for an agent",
-  request: { params: z.object({ id: z.string() }) },
+  path: "/api/companies/{companyId}/setup-token-login-sessions",
+  tags: ["companies"],
+  summary: "Start a company-and-environment Claude setup-token login session",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(startClaudeSetupTokenSessionRequestSchema),
+  },
   responses: {
-    201: r.ok(),
+    201: r.ok(claudeSetupTokenSessionOwnerResponseSchema),
     400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
@@ -4520,12 +4576,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
-  path: "/api/agents/{id}/setup-token-login-sessions/{sessionId}/prompt",
-  tags: ["agents"],
-  summary: "Read the login prompt for a setup-token login session",
-  request: { params: z.object({ id: z.string(), sessionId: z.string() }) },
+  path: "/api/companies/{companyId}/setup-token-login-sessions/{sessionId}",
+  tags: ["companies"],
+  summary: "Read the status of a Claude setup-token login session",
+  request: { params: z.object({ companyId: z.string(), sessionId: z.string() }) },
   responses: {
-    200: r.ok(),
+    200: r.ok(claudeSetupTokenSessionResponseSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/setup-token-login-sessions/{sessionId}/prompt",
+  tags: ["companies"],
+  summary: "Read the login prompt for a Claude setup-token login session",
+  request: { params: z.object({ companyId: z.string(), sessionId: z.string() }) },
+  responses: {
+    200: r.ok(claudeSetupTokenSessionPromptSchema),
     400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
@@ -4535,12 +4605,15 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
-  path: "/api/agents/{id}/setup-token-login-sessions/{sessionId}/code",
-  tags: ["agents"],
-  summary: "Submit the browser code for a setup-token login session",
-  request: { params: z.object({ id: z.string(), sessionId: z.string() }) },
+  path: "/api/companies/{companyId}/setup-token-login-sessions/{sessionId}/code",
+  tags: ["companies"],
+  summary: "Submit the browser code for a Claude setup-token login session",
+  request: {
+    params: z.object({ companyId: z.string(), sessionId: z.string() }),
+    body: jsonBody(submitBrowserCodeRequestSchema),
+  },
   responses: {
-    200: r.ok(),
+    200: r.ok(claudeSetupTokenSessionResponseSchema),
     400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
@@ -4550,41 +4623,32 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
-  path: "/api/agents/{id}/setup-token-login-sessions/{sessionId}/cancel",
-  tags: ["agents"],
-  summary: "Cancel a setup-token login session",
-  request: { params: z.object({ id: z.string(), sessionId: z.string() }) },
+  path: "/api/companies/{companyId}/setup-token-login-sessions/{sessionId}/completion",
+  tags: ["companies"],
+  summary: "Read the completion claim of a Claude setup-token login session",
+  request: { params: z.object({ companyId: z.string(), sessionId: z.string() }) },
   responses: {
-    200: r.ok(),
-    401: r.unauthorized,
-    403: r.forbidden,
-    404: r.notFound,
-  },
-});
-
-registry.registerPath({
-  method: "post",
-  path: "/api/agents/{id}/setup-token-login-sessions/{sessionId}/expire",
-  tags: ["agents"],
-  summary: "Expire a setup-token login session",
-  request: { params: z.object({ id: z.string(), sessionId: z.string() }) },
-  responses: {
-    200: r.ok(),
-    401: r.unauthorized,
-    403: r.forbidden,
-    404: r.notFound,
-  },
-});
-
-registry.registerPath({
-  method: "post",
-  path: "/api/agents/{id}/setup-token-login-sessions/{sessionId}/token",
-  tags: ["agents"],
-  summary: "Receive the token from a completed setup-token login session",
-  request: { params: z.object({ id: z.string(), sessionId: z.string() }) },
-  responses: {
-    200: r.ok(),
+    200: r.ok(claudeSetupTokenCompletionResponseSchema),
     400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/setup-token-login-sessions/{sessionId}/cancel",
+  tags: ["companies"],
+  summary: "Cancel a Claude setup-token login session",
+  // The 404 is reserved for the pre-scope non-member gate. The company-access
+  // gate runs before the cancel logic and returns a fixed 404 for a non-member.
+  // Cancel itself is idempotent and stays uniform: a same-company owner-scoped
+  // missing, terminal, or foreign session id all return 200. So the route never
+  // confirms a session exists for the owner.
+  request: { params: z.object({ companyId: z.string(), sessionId: z.string() }) },
+  responses: {
+    200: r.ok(),
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
@@ -4607,6 +4671,8 @@ registry.registerPath({
   path: "/api/issues/{id}/interactions",
   tags: ["issues"],
   summary: "Create an issue thread interaction",
+  description:
+    "Resolver policy defaults to canonical `anyone` for every interaction kind. `not_creator` and `human_only` are opt-in restrictions; deprecated `board_or_agents` and `board_only` inputs are accepted as compatibility aliases.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(createIssueThreadInteractionSchema),
@@ -5522,6 +5588,26 @@ registry.registerPath({
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/environments/{environmentId}/custom-image-template/relink",
+  tags: ["environments"],
+  summary: "Relink a detached environment customImage template to the current config",
+  request: {
+    params: z.object({ environmentId: z.string() }),
+    query: environmentCustomImageCompanyQuerySchema,
+    body: jsonBody(relinkEnvironmentCustomImageTemplateSchema),
+  },
+  responses: {
+    200: r.ok(environmentCustomImageTemplateRelinkResultSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
   },
 });
 
