@@ -275,6 +275,29 @@ describe("ACPX runtime host", () => {
     ).rejects.toThrow();
   });
 
+  it("rejects Pi before installation or runtime launch", async () => {
+    const fixture = await hostFixture();
+    const verifyInstallation = vi.fn();
+    const openRuntime = vi.fn();
+    await expect(
+      AcpxRuntimeHost.open(
+        {
+          ...fixture.options,
+          agent: "pi" as never,
+          model: "openrouter/deepseek/deepseek-v4-flash-0731",
+          permissionMode: "approve-reads",
+        },
+        {
+          verifyInstallation,
+          openRuntime,
+          reportRetainedCleanupFailure: vi.fn(),
+        },
+      ),
+    ).rejects.toThrow("descriptor-confined verified launch");
+    expect(verifyInstallation).not.toHaveBeenCalled();
+    expect(openRuntime).not.toHaveBeenCalled();
+  });
+
   it("selects and verifies Claude's qualified reported model", async () => {
     const fixture = await hostFixture();
     let selected = false;
@@ -413,7 +436,6 @@ describe("ACPX runtime host", () => {
         .mockRejectedValueOnce(new Error("first admission cleanup failed"))
         .mockImplementationOnce(() => retryClose),
     });
-
     await expect(
       AcpxRuntimeHost.open(
         {
@@ -462,6 +484,79 @@ describe("ACPX runtime host", () => {
       },
     });
     await contender.close();
+  });
+
+  it("bounds post-handshake model verification and cleans the runtime", async () => {
+    const fixture = await hostFixture();
+    const runtime = runtimePort({
+      getStatus: () => new Promise<never>(() => undefined),
+    });
+    const dependencies = fixture.dependencies({
+      openRuntime: async () => runtime,
+    });
+    dependencies.admissionVerificationTimeoutMs = 1;
+
+    await expect(
+      AcpxRuntimeHost.open(
+        {
+          ...fixture.options,
+          agent: "codex",
+          model: "gpt-5.6-sol",
+          permissionMode: "approve-all",
+          environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
+        },
+        dependencies,
+      ),
+    ).rejects.toThrow("admission verification exceeded its deadline");
+    expect(runtime.close).toHaveBeenCalledOnce();
+    expect(fixture.commandClose).toHaveBeenCalledOnce();
+  });
+
+  it("bounds post-handshake cleanup while retaining its exact owner", async () => {
+    const fixture = await hostFixture();
+    let finishRuntimeClose!: () => void;
+    const runtimeClose = new Promise<void>((resolve) => {
+      finishRuntimeClose = resolve;
+    });
+    const runtime = runtimePort({
+      getStatus: () => new Promise<never>(() => undefined),
+      onClose: () => runtimeClose,
+    });
+    const dependencies = fixture.dependencies({
+      openRuntime: async () => runtime,
+    });
+    let retainedAdmissionCleanup: Promise<void> | null = null;
+    dependencies.retainAdmissionCleanup = (cleanup) => {
+      retainedAdmissionCleanup = cleanup;
+    };
+    dependencies.admissionVerificationTimeoutMs = 1;
+    dependencies.admissionCleanupTimeoutMs = 1;
+
+    await expect(
+      AcpxRuntimeHost.open(
+        {
+          ...fixture.options,
+          agent: "codex",
+          model: "gpt-5.6-sol",
+          permissionMode: "approve-all",
+          environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
+        },
+        dependencies,
+      ),
+    ).rejects.toThrow("initialization and cleanup failed");
+    expect(runtime.close).toHaveBeenCalledOnce();
+    expect(fixture.commandClose).toHaveBeenCalledOnce();
+    expect(retainedAdmissionCleanup).not.toBeNull();
+    let cleanupSettled = false;
+    void retainedAdmissionCleanup!.finally(() => {
+      cleanupSettled = true;
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+    expect(cleanupSettled).toBe(false);
+
+    finishRuntimeClose();
+    await retainedAdmissionCleanup;
+    expect(cleanupSettled).toBe(true);
   });
 
   it("retains credential ownership when runtime shutdown fails until retry succeeds", async () => {
@@ -871,6 +966,8 @@ describe("ACPX runtime host", () => {
     const credentialAdmission = deferred<{
       path: string;
       mode: "inline_json";
+      lifetimeFenceFds: readonly [number, number];
+      activateLifetimeOwner(pid: number): Promise<void>;
       close(): Promise<void>;
     }>();
     const cleanupFailure = new Error("transient credential cleanup failure");
@@ -908,6 +1005,8 @@ describe("ACPX runtime host", () => {
     credentialAdmission.resolve({
       path: lateCredentialPath,
       mode: "inline_json",
+      lifetimeFenceFds: [42, 43],
+      activateLifetimeOwner: async () => undefined,
       close: lateCredentialClose,
     });
 
@@ -1043,6 +1142,8 @@ describe("ACPX runtime host", () => {
         stageCredential: async () => ({
           path: join(fixture.root, "auth.json"),
           mode: "inline_json",
+          lifetimeFenceFds: [42, 43],
+          activateLifetimeOwner: async () => undefined,
           close: credentialClose,
         }),
       },
