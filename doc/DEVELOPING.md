@@ -733,9 +733,35 @@ Lease recovery is bounded and explicit. Another issue may reclaim the lane once 
 
 For Tailscale HTTPS exposure, readiness includes stable listener-ownership checks for every requested loopback port (the app and, when configured, its Vite HMR companion). Each listener must belong to the spawned managed process group; an unrelated listener that races onto either reserved port fails the start closed before the broker is asked to expose it.
 
-In Vite middleware mode, Paperclip gives HMR a dedicated HTTP server bound to the managed runtime's loopback host. The browser still derives the HMR hostname from the public HTTPS page, so listener containment does not break remote hot reload.
+Managed `paperclip-dev` worktree services enable `PAPERCLIP_UI_DEV_MIDDLEWARE=true` by default, so newly started worktrees hot-reload UI source changes. Managed HTTPS services use this default only when they publish the Paperclip Vite HMR companion listener, which is the default exposure configuration. A service or adapter can explicitly set the variable to `false` when it intentionally needs to exercise the built UI bundle.
+
+In Vite middleware mode, Paperclip gives HMR a dedicated HTTP server bound to the managed runtime's loopback host. The browser still derives the HMR hostname from the public HTTPS page, and exposed runtimes use secure WebSockets, so listener containment does not break remote hot reload.
 
 When a workspace service runs Paperclip for browser OAuth QA, configure its `expose.urlTemplate` with the canonical URL the browser can reach. Paperclip preserves explicit `PAPERCLIP_PUBLIC_URL` or `BETTER_AUTH_URL` settings; otherwise it uses a valid exposed HTTPS origin (or loopback HTTP) as the managed runtime fallback for Better Auth and `/api/tools/oauth/callback`. Internal service names such as `http://paperclip-dev:<port>` are rejected unless that hostname is genuinely the browser route. Use a unique origin per isolated worktree. See [Execution Workspaces And Runtime Services](../docs/guides/board-operator/execution-workspaces-and-runtime-services.md#browser-reachable-origins-for-oauth-qa) for configuration and verification.
+
+## Paperclip Runner Adapter Conversion
+
+The experimental Paperclip Runner currently qualifies four local profiles:
+Codex, OpenCode, ACPX Claude, and ACPX Codex. Changing an existing agent to
+`paperclip_runner` remains supported only from `codex_local`; create the other
+profiles explicitly after enabling the single **Paperclip Runner** experimental
+setting. Onboarding continues to create legacy adapters. Disabling the setting
+blocks fresh native starts without hiding or corrupting persisted native runs.
+
+Native Codex is qualified only with `codexPermissionMode: "never"`. The create
+and edit surfaces do not offer `on-request` or `untrusted`, and a persisted
+unsupported value fails with remediation instead of being silently coerced.
+OpenCode retains `allow`, `ask`, and `deny`; ACPX retains `approve-all`,
+`approve-reads`, and `deny-all`. Codex conversion keeps a non-empty model and
+otherwise stores the shared `gpt-5.6-sol` default. The native execution boundary
+applies the same default to older runner rows whose model is missing or blank.
+
+For native Codex runs, Paperclip passes the resolved execution workspace as
+`PAPERCLIP_WORKSPACE_CWD` and uses it as the provider containment boundary. A
+workspace below the host `HOME` is valid, including the default projectless
+agent workspace. The host `HOME` itself, a directory that contains it, a
+filesystem root, a `CODEX_HOME` overlap, or a canonical path outside the
+assigned workspace is rejected before provider startup.
 
 ## App-Shipped Skills Catalog
 
@@ -969,6 +995,24 @@ host configured by `PAPERCLIP_PAGES_API_URL` is included automatically. Every
 broker hostname is resolved once and the request is pinned to the approved
 address; IPv4 and IPv6 link-local destinations remain denied even when their
 host is allowlisted.
+
+## HTTP Adapter Private Endpoints
+
+HTTP adapters can call public HTTP(S) endpoints by default. Requests use the
+same DNS-pinning guard as remote connections, do not follow redirects, and
+reject loopback, RFC1918/private, and link-local or cloud-metadata destinations.
+
+Server owners can opt a trusted private service in with a comma-separated list
+of exact origins:
+
+```sh
+PAPERCLIP_HTTP_ADAPTER_PRIVATE_ENDPOINT_ALLOWLIST=http://hooks.internal.example:8080,https://10.0.0.42
+```
+
+Each entry must contain only a scheme, hostname, and optional port. Paths,
+credentials, query strings, fragments, and wildcards are ignored. Matching is
+by exact normalized origin, so allowing one port does not allow another.
+Link-local destinations remain denied even when explicitly listed.
 
 ## Company Deletion Toggle
 
