@@ -68,6 +68,7 @@ export type {
 
 export type ToolActorType = "agent" | "user" | "system" | "plugin";
 export type ToolConnectionTransport = "mcp_remote" | "rest_api" | "local_stdio";
+export type ToolConnectionPurpose = "tool" | "channel";
 export type ToolConnectionAuthKind = "oauth" | "api_key" | "none";
 export type ToolConnectionOwnership = "platform_shared" | "platform_provisioned" | "customer" | "dcr";
 export type ToolConnectionCredentialSource = "paperclip_vault" | "vercel_connect";
@@ -177,6 +178,8 @@ export interface ToolConnection {
   credentialSecretRefs: ToolCredentialSecretRef[];
   credentialRefs?: McpConnectionCredentialRef[];
   healthStatus: ToolConnectionHealthStatus;
+  /** Managed GitHub grant state; transient health failures do not require sign-in. */
+  requiresReauthorization?: boolean;
   healthMessage?: string | null;
   healthCheckedAt: Date | null;
   lastHealthAt?: Date | string | null;
@@ -224,9 +227,12 @@ export interface ConnectionGrant {
       repositorySelection: "all" | "selected" | "mixed" | "none";
       installationIds: string[];
       installationOwnerLogins: string[];
+      /** Repository metadata visible to this credential; refreshed from GitHub. */
+      repositories?: Array<{ id: string; fullName: string; installationId: string; private?: boolean }>;
       installationUrl?: string;
       managementUrl?: string;
       appSlug?: string;
+      accessRevision?: string;
       lastAccessRefreshAt?: string;
       lastWebhookAt?: string;
       webhookHealth?: "pending" | "healthy" | "unhealthy";
@@ -1490,6 +1496,7 @@ export interface ToolTrustRuleBatchApprovalConfig {
 }
 
 export interface CreateToolTrustRuleFromActionRequest {
+  argumentMode?: "exact" | "action";
   name?: string;
   description?: string | null;
   priority?: number;
