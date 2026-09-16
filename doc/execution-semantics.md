@@ -376,6 +376,17 @@ If the committed update assigns the issue to a user, clears the agent assignee, 
 
 Plain text is not assignment. Writing an agent's name, role, or team label in a comment does not change ownership and does not create an agent wake. Agent routing from comment text requires a structured agent mention that resolves inside the company, an explicit `assigneeAgentId` mutation, or an existing current agent assignee receiving normal issue-thread feedback.
 
+A delegation comment from the current assignee's run on this parent must not start competing parent work when the named worker already owns the referenced child. This applies to issue updates with a comment and standalone comments. Verify the source run's company, agent, and parent-task context. Then verify that the comment references the child's identifier, the child's `parentId` names this parent, and the child belongs to the same company and is assigned to the mentioned worker. Apply child-aware routing only in either of these states:
+
+- The parent is `blocked` and the child is `in_progress`. The child must have a blocker edge to the parent. The child's execution or checkout run must still be `running`, belong to that worker and company, and name that child in its run context. Verify comment and mutation access to the child, then retain the parent comment and append a linked copy on the child. Preserve the full comment, author, source run, responsible-user attribution, and source trust. Target the normal mention wake at the child and its new comment ID, with explicit resume and follow-up intent. This keeps new feedback available to the worker and lets the existing queue serialize a child continuation behind its current execution.
+- The parent and child are both `done`. The assignee's closing comment must not start another worker run for the completed delegation. A blocker edge is not required after completion: a fast child can finish before the lead needs to record a wait. New agent work must use explicit `resume: true`, a status change, or a new assigned task. Explicit resume moves the parent out of `done` before this rule runs; the comment's prose alone does not restart completed work.
+
+The completed-delegation comment remains on the parent without a worker wake. Neither path changes ownership. Board-user comments and unrelated mentions retain their normal wake behavior. If multiple referenced children qualify for the same worker, the child or run no longer meets these conditions, child comment or mutation access is denied, or a lookup or copy fails, use the normal parent mention path. Do not parse mentions again while copying a comment, which would create another routing loop. Completion of the child still uses the existing blocker-resolution wake for the parent's assignee.
+
+The parent may receive a closing comment before its assignee changes the status to `done`. Recheck the completed-delegation rule when releasing that parent execution, before promoting a deferred mention. On the same transaction, verify the final parent state, finishing run, and every original queued or deferred comment ID. Each comment must belong to this parent and company, come from its assignee's finishing run, and reference exactly one completed direct child assigned to the mentioned worker. A link to the parent itself is allowed; any other extra issue reference keeps the normal mention path, including an unknown or foreign reference. Mixed human, other-run, unrelated, or ambiguous input retains its normal wake path. Explicit continuation and interaction requests also retain their normal path.
+
+Accepted agent feedback must survive a child changing to `done` before its active run exits. Deferred wake promotion may reopen that completed child only for its current assignee, with explicit agent resume intent and live tracked comments from another author. Claim promotion before reopening. Cancelled tasks, deleted comments, self-authored comments, empty continuations, and agent continuations without explicit intent keep their existing suppression rules. Normal pause, ownership, authorization, and budget gates still apply.
+
 Pause and tree-control previews should make the same distinction visible. They should report whether the affected subtree contains live running work, queued wakes, agent-owned work, or only human-owned/static issues, so a pause after a handoff does not look like it interrupted agent execution when no agent execution path existed.
 
 ### Adapter-backed workspace coherence
@@ -400,6 +411,26 @@ Workspace incoherence feeds into the same non-terminal liveness and stranded ass
 
 For runtime-created `git_worktree` execution workspaces, branch coherence is part of workspace coherence. The persisted execution workspace branch is the recorded branch for future dispatch. Reusing that workspace must verify that the worktree is still registered and that `HEAD` is on the recorded branch. Successful run finalization must perform the same check before recording `workspace_finalize=succeeded`. If the run switched to a publishing/PR branch without updating the execution workspace record, finalization may auto-restore the recorded branch only when the worktree is clean, still registered, and the recorded branch points at the current `HEAD`; the repair is recorded as a workspace operation before the successful finalize row. If that safe repair cannot be proven, finalization records a failed workspace finalize and the run fails with bounded evidence for the expected and actual branch. A branch change is sanctioned when a control-plane path updates the execution workspace record before finalization, when publishing work happens in a separate worktree and the managed issue worktree remains on its recorded branch, or when the finalizer performs this clean same-commit restoration.
 
+### Workspace scan failures before provider startup
+
+Repository discovery distinguishes an ordinary folder from a failed Git read.
+A timeout, full scan queue, cancellation, output limit, or Git failure must keep
+its typed cause through workspace preparation and run persistence. It must not
+be reported as a missing repository or fall back to an unfiltered directory copy.
+
+When workspace preparation fails before provider work starts, scan timeouts and
+queue saturation use the existing durable failure budget: two automatic retries,
+30 seconds apart. The scheduled successor is persisted before execution is
+released. Restart and duplicate wake handling reuse that successor. Normal task,
+ownership, pause, dependency, approval, and budget gates still apply. Existing
+workspace content is retained, and incomplete temporary clones are not published.
+
+Cancelled scans, output-limit failures, and other Git failures do not authorize
+an automatic setup retry. Exhaustion or an unsafe retry opens the source-scoped
+recovery path with the specific scan cause and an operator action. Generic
+stranded-work recovery must not grant another budget for these errors. This
+does not automatically replay historical generic `setup_failed` runs.
+
 ### ACP startup handshake bound
 
 An adapter-backed live path also requires that the ACP startup handshake itself cannot hang forever. The engine bounds the handshake with a fixed startup deadline and a poll of the duplex control-channel disposition. Either condition ends the handshake and reports a closed, typed code, so the issue can reach a settled disposition instead of staying `in_progress` with no observable next action.
@@ -409,6 +440,8 @@ The handshake failure code is distinct from a session-identity mismatch. A timeo
 ### Explicit recovery actions
 
 An explicit recovery action is a typed liveness repair path for a source issue. It is the recovery primitive; the action can be rendered directly on the source issue or backed by a separate recovery issue when the repair needs its own work item.
+
+A new user message can continue a terminal native run whose process fields were cleared before local stop receipts existed. Admission must verify the exact run, runner, workspace, and provider session in the retained suspended state, with no active provider turn, pending tool call, or undelivered output. Missing or mismatched state keeps the hold. A later recorded process launch also keeps the hold until its stop is verified. Normal assignment, decision, controller, environment cleanup, and active-run gates still apply. The message starts one fresh conversation turn; it does not replay the failed run, reset its recovery budget, or certify unknown action outcomes.
 
 The task thread exposes the existing guarded Retry action for failed or timed-out legacy conversation runs. Where the server supports an explicit new attempt after a stopped legacy conversation, the thread must not hide that action solely because the old run still has a recovery-needed projection. Native and process recovery holds, pending decisions, active execution, and other retry gates remain in force. When a gate hides Retry, the thread says the message is preserved instead of promising an unavailable action. This presentation change does not rewrite historical outcomes or certify prior actions.
 
@@ -834,6 +867,11 @@ apply. Stream closure without a turn terminal is not proof of success. Event
 replay uses the existing source receipts and never repeats provider work merely
 to recover recorded output.
 
+If runnerd synthesizes a result when the provider stops, it publishes that result
+before the provider-turn terminal and publishes the run terminal last. The
+adapter can therefore retain the result while the matching turn still has
+authority. A late result must not reopen an already finalized turn.
+
 Routine task completion and human-input requests must work under Conservative
 runner permissions. The isolated Claude runtime grants only the narrow task
 tools on the runner-owned bridge; it does not change general tool permissions.
@@ -853,6 +891,11 @@ it does not create a pause hold. An acknowledged intentional cancellation remain
 neutral even if teardown releases the run lease or returns no semantic result.
 **Pause work** separately controls future execution. A crash preventing progress
 is **Blocked**; **In Review** requires a concrete human decision.
+
+Subtree pause and cancel record the authenticated board actor on each run they
+interrupt. A verified native stop must not become an unexplained failure simply
+because it came from a subtree action. The explicit pause hold still prevents
+future execution until Resume, and missing stop proof still blocks continuation.
 
 ### Provider continuity and bounded finalization
 
@@ -1158,3 +1201,93 @@ and final dispatch gates. Queued and final native replacement dispatch also
 re-read dependency readiness, since new dependencies need not change the
 displayed task status. Old blocked rows without a receipt remain held; no
 historical status backfill is performed.
+
+### Queued input after a native Stop
+
+A run-only Stop ends the current response. It does not discard queued user
+messages or require a recovery incident. After the controller releases ownership
+and the old local process or remote environment has a verified stop record,
+Paperclip submits saved input through normal task admission, once, with the
+original user's authority. Pauses, task ownership, budgets, approvals, and
+execution recovery holds still apply. Unconfirmed cleanup does not start work.
+
+The active session advertises steering only when its driver supports it. A
+transport method that rejects steering does not grant that capability. The
+queued-message control remains mounted until the server accepts a steer request,
+so a rejected last-row action keeps its message and visible error.
+
+### Preserve work across handoff and deliver requested files
+
+An agent handoff carries the interrupted run's authorized task history, completed
+semantic actions, and available result summary to the replacement agent. The
+replacement must inspect existing files and preserve completed content before
+editing. Source history is still scoped to the same company and task; prior
+results are untrusted evidence, not instructions or new authorization.
+Saved task comments move into that successor's delivery receipt in the same
+transaction that queues it. Their original authors remain intact. A former
+assignee's ordinary comment wake must not start another execution or reopen a
+completed task after the replacement finishes. Mentions, chat deliveries, and
+dedicated interaction continuations retain their separate delivery contracts.
+
+A requested file is complete when the user can retrieve it. Native runners must
+register requested output files before reporting Done and link the resulting
+attachment in their answer. Completion feedback rejects workspace-only file
+references and fabricated or cross-task delivery receipts. Text answers and
+accessible repository work products do not require an attachment. Publication
+failure calls for continued work or a concrete blocker, not a human confirmation
+that the task is complete.
+
+For an explicit file output in the current request, an empty report, a
+verification-only reference, or an unregistered URL cannot satisfy delivery.
+The report must cite an attachment verified by the current run's durable
+publication receipt, matching its task, filename, size, and SHA-256, or an
+accessible work product registered by that run with a published URL. A prior
+run's output cannot stand in for a newly requested file. A same-run controller
+restart keeps the receipt; a replacement can inspect and re-register preserved
+workspace bytes without user bookkeeping. Follow-ups requesting no new file can
+still reference existing downloads. Prior downloads can also accompany a valid
+current output as context. Authorized chat attachment reuse supplies a current-run
+publication receipt for its verified clone; older reuse receipts must additionally
+match an intact company-scoped source's filename, size, and hash.
+A `workspace_file` locator alone is not delivery
+evidence: it neither verifies the file nor preserves its bytes after cleanup.
+Reading or reviewing an existing file for an inline answer does not
+require uploading that input. Ambiguous prose remains subject to the runner's
+completion contract; the server's explicit-output check is deliberately narrow.
+
+Local and remote runners use the same attachment publication contract. Remote
+files are read through the bound environment runner, with workspace confinement,
+no symlinks or hardlinks, stable file identity, a 10 MiB bound, and exact size and
+SHA-256 checks before storage. Remote paths are never opened on the controller.
+
+An asynchronous remote signal failure, including a sandbox already removed by
+the operator, must not crash the controller. Logging that failure must also be
+contained. A rejected signal does not prove termination: existing process and
+provider monitoring still own stop acknowledgement and cleanup proof.
+
+Protocol-failure handling can begin transport cleanup before the owning runtime
+awaits it. That background invocation observes rejection immediately, including
+when a remote sandbox has already disappeared. The owner's awaited close still
+receives the original failure; containment never fabricates a successful close
+or permission to reuse an unverified execution.
+
+### Assigned connections in native ACPX sessions
+
+Native ACPX sessions register the assigned Paperclip MCP gateway alongside the
+task tool bridge. Gateway calls retain the existing connection grants and action
+approvals. Missing assigned bindings and names that collide with the task bridge
+stop admission. Upstream credentials remain with the gateway; providers receive
+its scoped access binding. The qualified ACPX sidecar receives the gateway name,
+URL, and token together through the launch allowlist; unrelated environment
+secrets remain excluded. This does not restrict arbitrary network access to a
+public service outside the gateway.
+
+
+### Use real connection requests (2026-09-14)
+
+When a user asks to connect a known service, the agent searches for that service
+and uses `connection_request` if setup is needed. The agent must not ask the same
+permission again or copy Connect / Not now into a generic question. A generic
+question does not start setup. The real connection card keeps user identity,
+access grants, the decision, and continuation together. This guidance does not
+approve a connection or bypass its normal user decision.

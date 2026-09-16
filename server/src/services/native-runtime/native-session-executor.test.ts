@@ -291,7 +291,8 @@ beforeEach(() => {
 });
 
 describe("remote runner process supervision", () => {
-  it("detaches runnerd from the provider RPC and monitors its durable identity", async () => {
+  it.each(["delivered", "sandbox_missing", "logging_failed"] as const)(
+    "detaches runnerd and contains asynchronous signal failures (%s)", async (signalOutcome) => {
     let launchNonce = "";
     const execute = vi.fn(
       async (input: {
@@ -354,6 +355,7 @@ describe("remote runner process supervision", () => {
           };
         }
         if (label === "paperclip-runner-signal") {
+          if (signalOutcome !== "delivered") throw new Error("Sandbox with ID test-deleted-sandbox not found");
           return {
             exitCode: 0,
             signal: null,
@@ -366,6 +368,9 @@ describe("remote runner process supervision", () => {
       },
     );
     const onSpawn = vi.fn(async () => undefined);
+    const onLog = vi.fn(async () => {
+      if (signalOutcome === "logging_failed") throw new Error("Run log already closed");
+    });
     const launcher = createRemoteRunnerProcessLauncher({
       target: {
         kind: "remote",
@@ -381,6 +386,7 @@ describe("remote runner process supervision", () => {
       diagnosticsDirectory: "/runtime/diagnostics",
       runnerInstanceId: "runner-remote",
       onSpawn,
+      onLog,
     });
 
     const handle = launcher({
@@ -424,6 +430,17 @@ describe("remote runner process supervision", () => {
         ),
       ).toBe(true),
     );
+    if (signalOutcome !== "delivered") {
+      await vi.waitFor(() => expect(onLog).toHaveBeenCalledWith(
+        "stderr", "Remote runner signal failed; process termination is not confirmed.\n",
+      ));
+      // Let rejected logging callbacks settle too. Neither failure may escape
+      // this fire-and-forget Node child-process-compatible kill boundary.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    } else {
+      expect(onLog).not.toHaveBeenCalled();
+    }
+    expect(handle.child.exitCode).toBeNull();
   });
 
   it("terminates a detached runner when its process identity cannot be adopted", async () => {
@@ -6449,6 +6466,21 @@ describe("native session bounded recovery", () => {
         new Error("native_current_wake_comments_changed_after_read"),
       ),
     ).toBe("native_current_wake_comments_changed_after_read");
+  });
+
+  it("requires operator action without retrying an approval-required terminal", () => {
+    const code = nativeSessionFailureSourceCode(
+      new NativeProviderTerminalFailure("approval_required", false, "Approval required"),
+    );
+    expect(code).toBe("native_provider_approval_required");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+      phase: "terminal_failure",
+      failureCode: "native_provider_approval_required",
+      nextAttemptAt: null,
+    });
+    expect(nativeSessionRecoveryProjection({
+      phase: "terminal_failure", failureCode: code, agentId: "agent-1",
+    })).toMatchObject({ issueStatus: "blocked", recoveryOwner: { kind: "board" } });
   });
 
   it("retries the same run twice and stops at the third failed attempt", () => {
