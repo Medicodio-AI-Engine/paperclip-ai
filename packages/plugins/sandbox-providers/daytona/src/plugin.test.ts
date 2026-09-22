@@ -3371,7 +3371,7 @@ describe("Daytona sandbox provider plugin", () => {
       expect(mockGet).toHaveBeenCalledTimes(2);
     });
 
-    it("realizes a resumed lease after the provider fills in an unspecified target", async () => {
+    it.each(["workspace", "projectless task"])("realizes a resumed %s lease after the provider fills in an unspecified target", async (scope) => {
       process.env.DAYTONA_API_KEY = "host-key";
       const sandbox = createMockSandbox({ id: "sandbox-default-target" });
       mockCreate.mockResolvedValue(sandbox);
@@ -3379,7 +3379,8 @@ describe("Daytona sandbox provider plugin", () => {
       const base = { driverKey: "daytona", companyId: "company-1", environmentId: "env-1" };
       const config = { image: "node:20", timeoutMs: 300000, reuseLease: true };
       const lease = await plugin.definition.onEnvironmentAcquireLease!({
-        ...base, runId: "run-1", agentId: "agent-1", executionWorkspaceId: "workspace-1", config,
+        ...base, runId: "run-1", agentId: "agent-1", config,
+        ...(scope === "workspace" ? { executionWorkspaceId: "workspace-1" } : { issueId: "task-1" }),
       });
       // The host materializes provider metadata into later operation config,
       // but resumes with the environment's original, target-less config.
@@ -3404,6 +3405,7 @@ describe("Daytona sandbox provider plugin", () => {
 
       sandbox.state = "stopped";
       const sentinel = lease.metadata!.workspaceSentinel as { token: string };
+      expect(sentinel.token).toMatch(/^[a-f0-9]{64}$/);
       sandbox.process.executeCommand.mockResolvedValueOnce({
         exitCode: 0, result: JSON.stringify({ token: sentinel.token }),
         artifacts: { stdout: JSON.stringify({ token: sentinel.token }) },
@@ -4090,7 +4092,7 @@ describe("daytona native file-sync hooks", () => {
     expect(provision!.attributes["paperclip.sandbox.startup.provider"]).toBe("daytona");
   });
 
-  it("syncIn tars a directory mapping host-side honoring excludes and the followSymlinks flag, then extracts it in-sandbox via a single quoted tar command", async () => {
+  it("gzip-tars a directory mapping host-side honoring excludes and the followSymlinks flag, then extracts it in-sandbox via a single quoted tar command", async () => {
     const hostDir = await makeHostDir();
     const sourceDir = path.join(hostDir, "assets");
     await fs.mkdir(path.join(sourceDir, "keep"), { recursive: true });
@@ -4132,8 +4134,8 @@ describe("daytona native file-sync hooks", () => {
     expect(sandbox.fs.uploadFiles).toHaveBeenCalledTimes(1);
     const [uploads] = sandbox.fs.uploadFiles.mock.calls[0] as [Array<{ source: string; destination: string }>];
     expect(uploads).toHaveLength(1);
-    expect(uploads[0].source).toMatch(/\.tar$/);
-    expect(path.posix.basename(uploads[0].destination)).toMatch(/^\.paperclip-upload-.*\.tar$/);
+    expect(uploads[0].source).toMatch(/\.tar\.gz$/);
+    expect(path.posix.basename(uploads[0].destination)).toMatch(/^\.paperclip-upload-.*\.tar\.gz$/);
     expect(uploads[0].destination.startsWith(`${REMOTE_DIR}/`)).toBe(true);
 
     // Inspect the real host tar: excluded file gone; symlink preserved AS a link.
@@ -4157,7 +4159,7 @@ describe("daytona native file-sync hooks", () => {
     // followed by removing the scratch tar.
     expect(extractCommand).toContain(".paperclip-runtime/assets");
     expect(extractCommand).toContain("tar -xf");
-    expect(extractCommand).toMatch(/rm -f .*\.paperclip-upload-.*\.tar/);
+    expect(extractCommand).toMatch(/rm -f .*\.paperclip-upload-.*\.tar\.gz/);
   });
 
   it("syncIn dereferences symlinks to bytes when followSymlinks is true (tar -h)", async () => {
