@@ -297,7 +297,9 @@ export const issueExecutionWorkspaceSettingsSchema = z
 
 export const issueAssigneeAdapterOverridesSchema = z
   .object({
-    adapterConfig: z.record(z.string(), z.unknown()).optional(),
+    adapterConfig: z.record(z.string(), z.unknown())
+      .refine(config => !Object.prototype.hasOwnProperty.call(config, "homeMode"), "homeMode must be set by an operator on the agent, not on a task")
+      .optional(),
     useProjectWorkspace: z.boolean().optional(),
   })
   .strict();
@@ -556,6 +558,14 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "blocked",
   "cancelled",
 ] as const;
+
+export const resumeWorkspaceFinalizationSchema = z.object({
+  actionId: z.string().guid(),
+  runId: z.string().guid(),
+  ownerToken: z.string().guid(),
+  controllerAndCopybackStopped: z.literal(true),
+  stopEvidence: z.string().trim().min(20).max(12000),
+}).strict();
 
 export const retryWorkspaceExportSchema = z.object({
   actionId: z.string().guid(),
