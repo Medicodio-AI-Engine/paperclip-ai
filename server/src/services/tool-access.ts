@@ -1,3 +1,4 @@
+import { notifyVoiceChange } from "./voice/voice-recovery-notifications.js";
 import { notifyToolConnectionHealth, writeToolConnectionHealthChange } from "./tool-connection-health-notifications.js";
 import { connectionHealthSchedule } from "./tool-access/catalog/health-schedule.js";
 import type { ConnectionManagementContext } from "./connection-management.js";
@@ -2111,6 +2112,9 @@ export function toolAccessService(
           sourceTemplateKey: galleryEntry.slug,
           connectionMethodKey: method?.key,
           methodConfig: normalizedMethodConfig?.values ?? {},
+          ...(galleryEntry.slug === "google-workspace" && retainedConnection?.status === "draft"
+            ? { workspaceSetup: retainedConnection.config.workspaceSetup }
+            : {}),
           ...(method?.defaults?.mcpSessionRequired === true
             ? { mcpSessionRequired: true }
             : {}),
@@ -4664,7 +4668,7 @@ export function toolAccessService(
         .returning();
       const [row] = existing.transport === "chat_sdk"
         ? await db.transaction(async tx => {
-            await notifyChatEndpointWork(tx, existing.id);
+            await notifyChatEndpointWork(tx, existing.id, existing.companyId);
             const rows = await write(tx as unknown as Db);
             // Credential resolution must never observe the binding rebuild's
             // delete/insert gap after a configuration wake.
@@ -4672,6 +4676,7 @@ export function toolAccessService(
             return rows;
           })
         : await writeToolConnectionHealthChange(db, existing, async tx => {
+            if (existing.transport === "voice") await notifyVoiceChange(tx, { kind: "connection", id: existing.id });
             const rows = await write(tx);
             await syncCredentialBindings(rows[0]!, [], tx);
             await createToolRuntimeSlots(tx, runtimeSupervisor).ensureRuntimeSlot(rows[0]!);
