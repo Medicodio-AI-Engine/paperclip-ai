@@ -1,4 +1,7 @@
+import { readNativeStartupCleanup, readNativeStartupContext } from "../native-runtime/native-startup-cleanup.js";
+import { legacyWorkspaceRecoveryNotMigrated } from "../legacy-workspace-recovery-migration.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
+import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { registerLiveRecoveryWork } from "./live-recovery-work.js";
 import { NATIVE_RETAINED_OWNER_WAIT } from "../native-runtime/native-controller-recovery.js";
 import { nativeEnvironmentSettlementDisposition, nativeEnvironmentSettlementWork } from "../native-runtime/native-environment-settlement-work.js";
@@ -960,6 +963,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           inArray(heartbeatRuns.status, ["running", "failed"]),
           isNull(nativeRunFinalizations.resultId),
           eq(nativeRunFinalizations.phase, "retryable_failure"),
+          legacyWorkspaceRecoveryNotMigrated(),
           or(gt(nativeRunFinalizations.nextAttemptAt, now), eq(nativeRunFinalizations.failureCode, NATIVE_RETAINED_OWNER_WAIT)),
         ),
       );
@@ -1011,6 +1015,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         if (disposition.kind === "awaiting_evidence" && disposition.retryAt) {
           scheduleNativeSessionResumeDispatch(disposition.runId, disposition.retryAt, "restart");
         }
+        // No ownership decision was made for a locked row. Writing an event
+        // would wait on that same row and defeat the non-blocking startup scan.
+        if (disposition.kind === "awaiting_evidence" && disposition.reason === "recovery_rows_busy") continue;
         const run = await getRun(disposition.runId);
         if (run) {
           const isClaim =
@@ -1034,7 +1041,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
                       ? "Native restart recovery is waiting for safe ownership evidence"
                       : disposition.kind === "already_finalized"
                         ? "Native restart recovery found an already-finalized result"
-                        : "Native restart recovery blocked ambiguous or conflicting ownership",
+                        : disposition.reason === "native_startup_cleanup_pending"
+                          ? "Native startup timed out; cancellation and verified cleanup are queued"
+                          : "Native restart recovery blocked ambiguous or conflicting ownership",
             payload: {
               restartKind: isClaim ? disposition.restartKind : restartKind,
               recoveryRequestId: isClaim
@@ -1159,9 +1168,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           processPid: run.processPid,
           processStartedAt: run.processStartedAt?.toISOString() ?? null,
         });
-        await db
-          .update(nativeRunFinalizations)
-          .set({
+        await db.transaction(async tx => {
+          await notifyLiveRunRecovery(tx, { companyId: run.companyId, runId: run.id });
+          await tx.update(nativeRunFinalizations).set({
             leaseExpiresAt: now,
             recoveryState: "awaiting_runner_reattach",
             recoveryHistory: sql`(
@@ -1188,6 +1197,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
               isNull(nativeRunFinalizations.resultId),
             ),
           );
+        });
         await appendRunEvent(run, {
           eventType: "native.recovery.transition",
           stream: "system",
@@ -1852,7 +1862,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   }
 
   async function nativeProcessIsLocal(run: HeartbeatRun) {
-    if (parseObject(run.runnerProfileJson).nativeWorkspaceSync != null) return false;
+    const profile = parseObject(run.runnerProfileJson);
+    if (profile.nativeWorkspaceSync != null || profile.remoteWorkspace != null) return false;
     const [identity] = await db.select({
       eventType: heartbeatRunEvents.eventType,
       agentId: heartbeatRunEvents.agentId,
@@ -2043,6 +2054,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           eq(heartbeatRuns.runtimeMode, "native"),
           eq(nativeRunFinalizations.phase, "retryable_failure"),
           isNull(nativeRunFinalizations.resultId),
+          legacyWorkspaceRecoveryNotMigrated(),
           sql`${heartbeatRuns.contextSnapshot}->'nativeQuestionCancellation' is null`,
         ),
       );
@@ -2057,7 +2069,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (!await nativeProcessIsLocal(run)) {
         if (nextAttemptAt && nextAttemptAt > now) continue;
         if (activeRunExecutions.has(run.id) || runningProcesses.has(run.id)) continue;
-        if (parseObject(run.runnerProfileJson).nativeWorkspaceSync != null) {
+        const profile = parseObject(run.runnerProfileJson);
+        if (profile.nativeWorkspaceSync != null || profile.remoteWorkspace != null) {
           remoteRetryRunIds.push(run.id);
         } else {
           const [taskLease] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
@@ -2246,6 +2259,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         nativeControllerProcessStartedAt:
           nativeRunFinalizations.controllerProcessStartedAt,
         nativeControllerLeaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
+        nativeLeaseOwner: nativeRunFinalizations.leaseOwner,
+        nativeControllerGeneration: nativeRunFinalizations.controllerGeneration,
+        nativeAttempt: nativeRunFinalizations.attempt,
+        nativeResultId: nativeRunFinalizations.resultId,
         nativeWorkspaceFinalizationPending: pendingNativeWorkspaceFinalizationCondition(db),
       })
       .from(heartbeatRuns)
@@ -2266,7 +2283,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       && !isNativeRunnerOwnershipHeld(run)
       && !activeRunExecutions.has(run.id) && !runningProcesses.has(run.id),
     ).map(({ run }) => run.id);
-    const remoteRecoveryRunIds = new Set(await listExpiredNativeRunnerAuthorities(db, now, expiredNativeRunIds));
+    const earlyStartupRunIds = activeRuns.filter(row => expiredNativeRunIds.includes(row.run.id) &&
+      readNativeStartupContext(row.run, { leaseOwner: row.nativeLeaseOwner, controllerGeneration: row.nativeControllerGeneration ?? 0,
+        attempt: row.nativeAttempt ?? 0, resultId: row.nativeResultId })).map(row => row.run.id);
+    const remoteRecoveryRunIds = new Set([...earlyStartupRunIds, ...await listExpiredNativeRunnerAuthorities(db, now, expiredNativeRunIds)]);
     if (remoteRecoveryRunIds.size) {
       const recovery = await recoverNativeRunsAfterRestart(now, [...remoteRecoveryRunIds]);
       for (const claim of recovery.claims) resumedRunIds.add(claim.runId);
@@ -2316,6 +2336,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       nativeControllerLeaseExpiresAt,
       nativeWorkspaceFinalizationPending,
     } of activeRuns) {
+      if (run.runtimeMode === "native" && readNativeStartupCleanup(run)) continue;
       if (parseObject(run.contextSnapshot).nativeQuestionCancellation) continue;
       // Native recovery owns these dispositions. Its writes happened after this
       // inventory was read; do not reap or overwrite them using the old row.
@@ -2759,7 +2780,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           scope.onDeferredDeadline(Date.now() + 30_000);
           return;
         }
-        await releaseSettledNativeRunProcess(db, scope.runId, scope);
+        const outcome = await releaseSettledNativeRunProcess(db, scope.runId, scope);
+        if (outcome !== "pending") await acknowledgeRemoteStop(scope.runId, scope.companyId);
       },
       orphanLease: scope => sweepOrphanedActiveLeases({ ...scope, backoffMs: 5 * 60_000 }),
       shutdown: scope => sweepLegacyShutdownWorkspaceSettlements(db, new Date(), scope),
