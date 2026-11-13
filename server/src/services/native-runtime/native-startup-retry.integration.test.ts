@@ -33,7 +33,7 @@ import { executePaperclipNativeSession, prepareNativeSessionOpenTimeoutRetry, sc
 import { buildNativeCompletionContract } from "./completion-contracts.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { claimNativeSessionResumptions } from "./native-finalization-reconciler.js";
-import { DurablePrpControlPlane } from "../../vendor/paperclip-runner/index.js";
+import { DurablePrpControlPlane, NativeProviderTerminalFailure } from "../../vendor/paperclip-runner/index.js";
 import { createNativeRunnerExecutionDriver } from "./native-runner-execution-driver.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { loadNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
@@ -432,6 +432,33 @@ describe("native provider startup retry", () => {
     }
   });
 
+  it("records a timed-out step's own cause and settles the run through the failure classifier", async () => {
+    const seeded = await seedRun(await createAgent());
+    const expired = AbortSignal.timeout(1);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    provider.execute.mockReset().mockImplementation(async () => { throw expired.reason; });
+    await expect(executePaperclipNativeSession({ db, execution: seeded.execution,
+      runnerInstanceId: seeded.runnerInstanceId,
+      backend: {
+        descriptor: async () => { throw new Error("Unexpected provider descriptor call"); },
+        openSession: async () => { throw new Error("Unexpected provider session call"); },
+      } })).rejects.toMatchObject({ name: "TimeoutError", message: "The operation was aborted due to timeout" });
+
+    const state = await read(seeded);
+    expect(state.coordinator).toMatchObject({
+      attempt: 1,
+      leaseOwner: null,
+      failureDetail: expect.objectContaining({
+        message: "The operation was aborted due to timeout",
+        originalFailureCode: "native_session_interrupted",
+        providerSessionEstablished: false,
+        providerEventsExist: false,
+      }),
+    });
+    expect(state.run).toMatchObject({ status: "failed", errorCode: state.coordinator.failureCode });
+    expect(state.run.errorCode).not.toBe("native_continuation_requires_reconciliation");
+  });
+
   it("retries a rejected session.open with growing backoff instead of blocking the task", async () => {
     const seeded = await seedRun(await createAgent());
 
@@ -784,6 +811,41 @@ describe("native provider startup retry", () => {
       })).toEqual([]);
     },
   );
+
+  it("asks for a model choice when the provider rejects the model on an opened session's turn (Claude ACPX)", async () => {
+    const seeded = await seedRun(await createAgent());
+    provider.execute.mockReset().mockImplementation(async () => {
+      await db.insert(heartbeatRunEvents).values({
+        companyId, runId: seeded.runId, agentId: seeded.agentId, seq: 900,
+        eventType: "turn.started", stream: "system",
+      });
+      // What the native runtime throws for Claude's AIR "selected model" request failure.
+      throw new NativeProviderTerminalFailure("RUNTIME", false,
+        "native_provider_model_rejected: ACP agent reported a terminal request failure.");
+    });
+    await expect(executePaperclipNativeSession({
+      db, execution: seeded.execution, runnerInstanceId: seeded.runnerInstanceId,
+      backend: {
+        descriptor: async () => { throw new Error("Unexpected provider descriptor call"); },
+        openSession: async () => { throw new Error("Unexpected provider session call"); },
+      },
+    })).rejects.toThrow("native_provider_model_rejected");
+
+    const state = await read(seeded);
+    expect(state.coordinator).toMatchObject({
+      phase: "terminal_failure",
+      failureCode: "native_provider_model_rejected",
+      nextAttemptAt: null,
+      failureDetail: expect.objectContaining({ providerSessionEstablished: true }),
+    });
+    expect(String(state.coordinator.failureDetail?.nextAction)).toContain("Choose a supported model");
+    expect(String(state.coordinator.failureDetail?.nextAction)).not.toContain("ambiguous");
+    expect(state.run).toMatchObject({ status: "failed", errorCode: "native_provider_model_rejected" });
+    expect(state.issue.status).toBe("blocked");
+    expect(state.action).toMatchObject({ ownerType: "board", cause: "native_provider_model_rejected", wakePolicy: null });
+    expect(state.action!.nextAction).toContain("Choose a supported model");
+    expect(state.action!.nextAction).not.toContain("ambiguous");
+  });
 
   it("blocks with a clear reason once the bounded startup budget is exhausted", async () => {
     const seeded = await seedRun(await createAgent());
